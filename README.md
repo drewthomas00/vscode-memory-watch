@@ -13,15 +13,15 @@ It found a real bug in under four hours. See [What it found](#what-it-found).
 
 ```console
 $ vscode-memory-watch --once      # one reading, right now
-VS Code tree: 9015 MB PSS (12042 MB RSS) across 46 processes, 8 Claude session(s)
-  renderer=4455MB exthost=505MB claude=2156MB tsserver=464MB langserver=330MB
-  helper=235MB nodeutil=597MB utility=21MB gpu=84MB main=151MB zygote=13MB
-  largest: renderer pid=3369519 at 3888 MB
+VS Code tree: 9589 MB PSS (12622 MB RSS) across 38 processes, 9 Claude session(s)
+  renderer=4942MB exthost=497MB claude=2417MB tsserver=346MB langserver=350MB helper=191MB nodeutil=567MB utility=21MB gpu=83MB main=155MB zygote=13MB
+  largest: renderer pid=3369519 at 4360 MB
+  (4 integrated-terminal process(es) excluded)
 
-  3981681 KB pss    4093008 KB rss  renderer   pid=3369519  window
-   469753 KB pss     542976 KB rss  nodeutil   pid=3369526
-   357101 KB pss     479916 KB rss  renderer   pid=1313239  window
-   341157 KB pss     459572 KB rss  claude     pid=1146880
+  4465437 KB pss    4576384 KB rss  renderer   pid=3369519  window
+   439848 KB pss     513072 KB rss  nodeutil   pid=3369526
+   336143 KB pss     458388 KB rss  claude     pid=3380222  session=e6e314ca-f038-44a1-8966-6bed829acd46
+   326732 KB pss     447744 KB rss  claude     pid=3372538  session=55322f72-2988-4235-a7b2-20b35822b51a
    ...
 ```
 
@@ -40,15 +40,28 @@ systemctl --user daemon-reload
 systemctl --user enable --now vscode-memory-watch.service
 ```
 
-Needs bash 4+, awk and Linux `/proc`. Nothing else.
+Needs **bash 4.2+** (for `printf '%()T'`), awk, coreutils and Linux `/proc`. `notify-send` is
+optional — without it the snapshot is still written, you just don't get the desktop alert.
 
 ## How it finds the tree
 
-It locates the VS Code **main process** and walks down to every descendant, rather than matching
-command lines against a known install path. That is what keeps it working across VS Code,
-Code - OSS, VSCodium, Cursor, Windsurf and code-server — none of which agree on where they live
-or what they call their user-data directory. It also means extension-spawned processes are
-attributed automatically, however obscure they are.
+It finds every **renderer**, walks *up* to the process that owns it, and then walks back down
+through the tree. Renderers are the anchor because a renderer is the one thing only a real editor
+instance has. That matters more than it sounds: a `code --wait` used as your git editor, or a
+`code --status`, spawns Chromium children of its own and matches every command-line pattern a real
+main process does. Identifying roots by pattern instead adopts those as extra instances, and since
+a change in the set of main processes is what ends a run, a routine `git commit` would silently
+discard hours of accumulated growth curve.
+
+Working from the tree rather than from install paths is also what keeps it working across VS Code,
+Code - OSS, VSCodium, Cursor, Windsurf and code-server, none of which agree on where they live or
+what they call their user-data directory.
+
+**The walk is bounded.** It descends through VS Code's own process types and stops at anything
+else, and it skips any process with a controlling terminal. So an extension's language server is
+counted, but the `cargo build` you started in the integrated terminal is not — that is your memory,
+not VS Code's, and sweeping it in would both inflate the headline and fire alerts naming the wrong
+thing. Excluded terminal processes are counted and reported so you know they were left out.
 
 Processes are then classified into tiers by command line, because every Chromium tier is the same
 binary under the same name:
@@ -60,7 +73,7 @@ binary under the same name:
 | `nodeutil` | other Node utility processes — shared process, pty host, file watcher |
 | `claude` | Claude Code session processes (one per open session) |
 | `tsserver`, `langserver` | TypeScript server and language servers |
-| `helper` | anything else an extension spawned: tool servers, language runtimes, terminal shells |
+| `helper` | anything else an extension spawned: tool servers, language runtimes |
 | `utility`, `gpu`, `main`, `zygote` | the rest of the Electron tree |
 
 Splitting `exthost` from `nodeutil` matters more than it sounds: the extension host, shared
@@ -81,18 +94,32 @@ counts it in a `pss_fallback` column, rather than quietly reporting RSS under a 
 
 ## Cost
 
-Per-process work is pure bash reading `/proc`: no forks, no subshells, no external commands in the
-sampling loop. Sampling cost doesn't grow with the size of the tree, which is what makes it cheap
-enough to leave running.
+A sample costs about **0.7 s of CPU on a 40-process tree** — roughly 1% of one core at the 60 s
+default. Almost all of it is the kernel: reading `smaps_rollup` makes it walk a process's page
+tables, which for a 4 GB renderer is genuinely expensive. That is the price of PSS, and there is no
+cheaper way to get an honest number. If it matters on your machine, raise `VSCODE_MEM_INTERVAL`.
+
+What the script itself does is cheap and deliberately kept that way: per-process work is pure bash
+reading `/proc`, with no forks or subshells, and the per-process detail table is only sorted when
+something is actually going to read it — not on the ~1,400 daily samples that produce no output.
+The service ships with `Nice=10` and `IOSchedulingClass=idle` so sampling never competes with the
+thing it is measuring.
 
 It walks `/proc` directly rather than using `pgrep -f`, whose pattern would match the watcher's own
-command line and count the watcher as part of what it's watching.
+command line. The bounded walk keeps that property: the watcher runs from systemd, outside the
+tree, and even run by hand from a VS Code terminal it is excluded along with the rest of the
+terminal's processes.
 
 ## Alerting
 
 When the tree crosses `12000` MB PSS, or any single process crosses `4000` MB, it sends a desktop
-notification and writes a full per-process snapshot to `snapshots/` — so the peak is captured
-instead of being lost to a reload. Rate-limited to one notification per 30 minutes.
+notification and writes a full per-process snapshot to `snapshots/`.
+
+The snapshot is rewritten on every **new high**, not just the first crossing — otherwise the
+notification cooldown would freeze the evidence at whatever the tree looked like when it first
+crossed the line, which is not the peak and not what you want to paste into a bug report.
+Notifications themselves stay rate-limited to one per 30 minutes, and that limit persists across
+restarts so a crash-looping service can't spam you.
 
 | variable | default | meaning |
 |---|---|---|
@@ -107,11 +134,20 @@ Samples land in `~/.local/state/vscode-memory-watch/history.csv`, one row per sa
 per tier. The header is generated from the tier list, so the columns can't drift from the data, and
 `--report` looks columns up by name rather than position.
 
-`--report` describes the **current run only**. A run ends when the set of main-process PIDs changes
-— that being the one signal that actually means the heap under observation was thrown away. It
-deliberately does *not* split on a gap in the log: a laptop that sleeps overnight leaves a gap, but
-the memory survives sleep and the run genuinely continues. Gaps are excluded from the growth-rate
-denominator instead, and reported.
+If the tier list ever changes, the old log is moved aside automatically rather than having new rows
+appended under a header that no longer describes them — a mismatched row reads as another tier's
+numbers, silently.
+
+`--report` describes the **current run only**. A run ends when the heap under observation was
+thrown away, which happens two ways: the editor restarts (the set of main processes changes), or
+you reload the window (the renderer tier collapses while the main process carries on — the more
+common case by far, and the one a main-PID check alone would miss). Reloads are counted and shown.
+
+It deliberately does *not* split on a gap in the log: a laptop that sleeps overnight leaves a gap,
+but the memory survives sleep and the run genuinely continues. Gaps are excluded from the
+growth-rate denominator instead, and reported. The sampling cadence used for that is measured from
+the data, not read from your environment — otherwise the shell you happen to run `--report` from
+could change the headline growth rate by a multiple.
 
 ## What it found
 

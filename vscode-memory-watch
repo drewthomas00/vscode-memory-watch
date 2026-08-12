@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # vscode-memory-watch — find out which VS Code process is eating your RAM.
 #
-# VS Code is a tree of 30+ processes that mostly share one binary and one name,
-# so "VS Code is using 20 GB" tells you nothing you can act on. This samples the
-# tree on an interval and records memory per tier, so the tier that climbs names
-# itself, and it captures a full per-process snapshot at the moment things go
+# VS Code is a tree of 30-50 processes that mostly share one binary and one
+# name, so "VS Code is using 20 GB" tells you nothing you can act on. This
+# samples the tree on an interval and records memory per tier, so the tier that
+# climbs names itself, and it captures a per-process snapshot when things go
 # bad — before a window reload destroys the evidence.
 #
 # Usage:
@@ -13,49 +13,64 @@
 #   vscode-memory-watch --report   growth per tier since the current run started
 #   vscode-memory-watch --help
 #
-# Design notes:
-#   - Reports PSS, not RSS. RSS counts every shared mapping once per process, so
-#     summing it across a 30-process Electron tree overstates real usage badly.
-#   - Finds processes by walking the tree from the VS Code main process down,
-#     rather than pattern-matching command lines. That keeps it working across
-#     VS Code, Code - OSS, VSCodium, Cursor, Windsurf and code-server, none of
-#     which agree on install paths or user-data directory names.
-#   - Per-process work is pure bash reading /proc — no forks, no subshells, no
-#     external commands. Sampling cost does not grow with the size of the tree,
-#     which is what makes it cheap enough to leave running.
-#   - Deliberately avoids `pgrep -f`, whose pattern would match this script's own
-#     command line and count the watcher as part of what it is watching.
+# Requires bash 4.2+ (printf %()T), awk, and Linux /proc. notify-send is
+# optional; without it the snapshot is still written.
 
 set -u
 
-readonly VERSION=1.1.0
+readonly VERSION=2.0.0
 
 readonly STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/vscode-memory-watch"
 readonly HISTORY="$STATE_DIR/history.csv"
 readonly SNAP_DIR="$STATE_DIR/snapshots"
+readonly NOTIFY_STAMP="$STATE_DIR/last-notify"
 
-INTERVAL="${VSCODE_MEM_INTERVAL:-60}"             # seconds between samples
-WARN_TOTAL_MB="${VSCODE_MEM_WARN_TOTAL:-12000}"   # whole-tree PSS warning line
-WARN_PROC_MB="${VSCODE_MEM_WARN_PROC:-4000}"      # single-process PSS warning line
-NOTIFY_COOLDOWN="${VSCODE_MEM_COOLDOWN:-1800}"    # seconds between notifications
-readonly MAX_HISTORY_BYTES=$((5 * 1024 * 1024))
+readonly INTERVAL="${VSCODE_MEM_INTERVAL:-60}"
+readonly WARN_TOTAL_MB="${VSCODE_MEM_WARN_TOTAL:-12000}"
+readonly WARN_PROC_MB="${VSCODE_MEM_WARN_PROC:-4000}"
+readonly NOTIFY_COOLDOWN="${VSCODE_MEM_COOLDOWN:-1800}"
+readonly MAX_HISTORY_ROWS=40000          # ~28 days at the 60s default
 
-# statm counts pages, not kilobytes, and the page size is not 4K everywhere:
-# arm64 kernels are commonly built with 16K pages, which would make every
-# figure four times too small.
+# Every one of these reaches an arithmetic context, where bash would evaluate
+# its contents as an expression — `TIER_KB[$(...)]` in an env var is command
+# execution. Validate before anything else touches them.
+for _pair in INTERVAL:VSCODE_MEM_INTERVAL WARN_TOTAL_MB:VSCODE_MEM_WARN_TOTAL \
+             WARN_PROC_MB:VSCODE_MEM_WARN_PROC NOTIFY_COOLDOWN:VSCODE_MEM_COOLDOWN; do
+    _name=${_pair%%:*}
+    if [[ ${!_name} != +([0-9]) || ${!_name} == +(0) ]]; then
+        printf '%s: %s must be a positive integer (got %q)\n' \
+            "${0##*/}" "${_pair#*:}" "${!_name}" >&2
+        exit 2
+    fi
+done
+unset _pair _name
+
+# statm counts pages, and the page size is not 4K everywhere: arm64 kernels are
+# commonly built with 16K pages, which would make every figure four times low.
 PAGE_KB=$(( $(getconf PAGESIZE 2>/dev/null || echo 4096) / 1024 ))
 readonly PAGE_KB
 
 # Reported in this order. The CSV header and every data row are generated from
-# this one list, so a new tier cannot desynchronise them.
+# this one list, so a row cannot desynchronise from its header.
 readonly TIERS=(
     renderer exthost claude tsserver langserver
     helper nodeutil utility gpu main zygote
 )
 
+# Executable names worth reading a command line for. Node renames its main
+# thread from v20 on, so `node-MainThread` (exactly 15 chars, the kernel's comm
+# limit) is what code-server actually presents.
+readonly FLAVOUR_COMMS='code|code-oss|code-insiders|codium|vscodium|cursor|windsurf'
+readonly CANDIDATE_COMMS="$FLAVOUR_COMMS|electron|node|node-MainThread"
+
 # ---------------------------------------------------------------------------
-# /proc readers. These set globals instead of echoing, because command
-# substitution forks a subshell and this runs once per process per sample.
+# /proc readers. These set globals rather than echoing: command substitution
+# forks a subshell, and this runs once per process per sample.
+#
+# Note the redirection order. `<file 2>/dev/null` does NOT silence a failed
+# open — redirections are applied left to right, so the error is reported
+# before fd 2 is replaced. /proc entries vanish mid-scan constantly, so the
+# stderr redirect has to come first or the daemon floods the journal.
 # ---------------------------------------------------------------------------
 
 CMD=""
@@ -64,73 +79,83 @@ read_cmdline() {
     CMD=""
     while IFS= read -r -d '' arg; do
         CMD+="$arg "
-    done <"/proc/$1/cmdline" 2>/dev/null
+    done 2>/dev/null <"/proc/$1/cmdline"
 }
 
-# PSS divides each shared page among the processes mapping it, which is the only
-# way the tiers add up to something meaningful. smaps_rollup carries a single
-# Pss: line; when it is unreadable (a short-lived process, or a kernel without
-# CONFIG_PROC_PAGE_MONITOR) we fall back to RSS and mark the figure rather than
-# quietly reporting RSS under a PSS heading.
-MEM_KB=0 PSS_EXACT=0
+# PSS divides each shared page among the processes mapping it, which is the
+# only way the tiers add up to something meaningful. smaps_rollup carries Rss
+# and Pss in one file, so both come from a single read at a single instant.
+MEM_KB=0 RSS_KB=0 PSS_EXACT=0
 read_mem() {
     local key val rest
-    PSS_EXACT=0 MEM_KB=0
+    MEM_KB=0 RSS_KB=0 PSS_EXACT=0
     while read -r key val rest; do
-        if [[ $key == Pss: ]]; then
-            MEM_KB=$val PSS_EXACT=1
-            return
-        fi
-    done <"/proc/$1/smaps_rollup" 2>/dev/null
-    read_rss "$1"
+        case "$key" in
+            Rss:) RSS_KB=$val ;;
+            Pss:) MEM_KB=$val PSS_EXACT=1; return ;;
+        esac
+    done 2>/dev/null <"/proc/$1/smaps_rollup"
+    # No rollup: a process exiting mid-sample, or a kernel built without
+    # CONFIG_PROC_PAGE_MONITOR. Fall back to RSS and mark it — never report RSS
+    # under a PSS heading without saying so.
+    local size resident
+    if read -r size resident rest 2>/dev/null <"/proc/$1/statm"; then
+        [[ $resident == +([0-9]) ]] && RSS_KB=$(( resident * PAGE_KB ))
+    fi
     MEM_KB=$RSS_KB
 }
 
-RSS_KB=0
-read_rss() {
-    local size resident rest
-    RSS_KB=0
-    read -r size resident rest <"/proc/$1/statm" 2>/dev/null || return
-    [[ $resident == +([0-9]) ]] && RSS_KB=$(( resident * PAGE_KB ))
+# ppid and tty from one stat read. comm is parenthesised and may itself contain
+# spaces or brackets, so the remainder is taken from the last ") ".
+P_PPID=0 P_TTY=0 P_COMM=""
+read_stat() {
+    local stat rest
+    P_PPID=0 P_TTY=0 P_COMM=""
+    # A command substitution performs its own redirection before any applied to
+    # the enclosing command, so `$(<f) 2>/dev/null` still prints. Wrapping in a
+    # group is what actually silences the vanished-process races.
+    { stat=$(<"/proc/$1/stat"); } 2>/dev/null
+    [[ -n $stat ]] || return 1
+    P_COMM=${stat#*\(}; P_COMM=${P_COMM%%\)*}
+    rest=${stat##*\) }
+    rest=${rest#* }                       # state
+    P_PPID=${rest%% *}; rest=${rest#* }   # ppid
+    rest=${rest#* }                       # pgrp
+    rest=${rest#* }                       # session
+    P_TTY=${rest%% *}                     # tty_nr
+    return 0
 }
 
 # ---------------------------------------------------------------------------
 # Classification
 # ---------------------------------------------------------------------------
 
-# Command lines that identify the top of a VS Code process tree. Everything else
-# is found by descending from here.
-is_root() {
-    local cmd="$1" comm="$2"
-    # Chromium children all carry --type=; a main process never does.
-    [[ $cmd == *"--type="* ]] && return 1
-    case "$cmd" in
-        */code.mjs*|*server-main.js*|*/out/main.js*) return 0 ;;
-    esac
-    # Flavours whose main process is a bare executable with no revealing args.
-    case "$comm" in
-        code|code-oss|code-insiders|codium|vscodium|cursor|windsurf) return 0 ;;
-    esac
-    return 1
+# Command lines of processes that are Chromium children of a root, keyed by the
+# executable the root itself was started from. A `--type=renderer` substring in
+# some other program's arguments must not buy it a place in the renderer tier —
+# that is the tier a leak report points at.
+declare -A ROOT_EXES=()
+is_chromium_child() {
+    local exe=${1%% *}
+    [[ -n ${ROOT_EXES[$exe]:-} ]]
 }
 
 ROLE=""
 classify() {
+    is_chromium_child "$1" || { classify_worker "$1"; return; }
     case "$1" in
-        *native-binary/claude*)              ROLE=claude ;;
-        *tsserver.js*|*typingsInstaller.js*) ROLE=tsserver ;;
-        *[Ss]erverMain*|*[Ss]erver.js*|*language-features*|*languageserver*)
-                                             ROLE=langserver ;;
-        *--type=zygote*)                     ROLE=zygote ;;
-        *--type=gpu-process*)                ROLE=gpu ;;
-        *--type=renderer*)                   ROLE=renderer ;;
+        # Chromium tiers first. Testing filename patterns before these lets any
+        # path containing "server.js" shadow a renderer, which is exactly the
+        # attribution this tool exists to get right.
+        *--type=zygote*)      ROLE=zygote ;;
+        *--type=gpu-process*) ROLE=gpu ;;
+        *--type=renderer*)    ROLE=renderer ;;
         *--type=utility*)
             case "$1" in
                 *node.mojom.NodeService*)
                     # Extension host, shared process, pty host and file watcher
                     # are all NodeService utilities with near-identical command
-                    # lines. Only the extension host is started with a debug
-                    # port, which is what separates it from its siblings.
+                    # lines. Only the extension host carries a debug port.
                     case "$1" in
                         *--inspect-port*|*--experimental-network-inspection*)
                              ROLE=exthost ;;
@@ -138,11 +163,35 @@ classify() {
                     esac ;;
                 *)   ROLE=utility ;;
             esac ;;
-        *--type=*)                           ROLE=utility ;;
-        # Anything else is a process an extension spawned: a tool server, a
-        # language runtime, an integrated terminal shell. Not "main" — only a
-        # root is main, and the caller assigns that.
+        *--type=*)            ROLE=utility ;;
+        # Same binary, no --type=: an extension worker launched through the
+        # bundled Electron (language servers all are). Not a main process.
+        *)                    classify_worker "$1" ;;
+    esac
+}
+
+# Workers an extension spawned. These are matched on the program being run, not
+# on Chromium flags, and are never descended into.
+classify_worker() {
+    case "$1" in
+        *native-binary/claude*)              ROLE=claude ;;
+        *tsserver.js*|*typingsInstaller.js*) ROLE=tsserver ;;
+        *eslintServer.js*|*jsonServerMain*|*serverWorkerMain*|*language-features*\
+        |*languageserver*|*language[-_]server*)
+                                             ROLE=langserver ;;
         *)                                   ROLE=helper ;;
+    esac
+}
+
+# True for the Chromium tiers that make up VS Code itself. The walk descends
+# through these and stops at anything else, so an extension's worker is counted
+# but whatever that worker goes on to run is not. A build in the integrated
+# terminal is your memory, not VS Code's, and sweeping it into the total both
+# inflates the headline and can fire an alert naming the wrong thing.
+is_internal_tier() {
+    case "$1" in
+        main|zygote|renderer|gpu|utility|exthost|nodeutil) return 0 ;;
+        *) return 1 ;;
     esac
 }
 
@@ -150,99 +199,113 @@ classify() {
 # Sampling
 # ---------------------------------------------------------------------------
 
-# Results of the most recent sample. Globals rather than a parsed stdout line so
-# that a snapshot's header and its process table always describe the same
-# instant — taking a second sample to fill in the detail would not.
 declare -A TIER_KB=()
 declare -a DETAIL=()
-SUM_PSS_KB=0 SUM_RSS_KB=0 N_PROCS=0 N_CLAUDE=0 N_FALLBACK=0
-TOP_ROLE=- TOP_PID=0 TOP_KB=0 ROOT_IDS=-
+DETAIL_SORTED=0
+SUM_PSS_KB=0 SUM_RSS_KB=0 N_PROCS=0 N_CLAUDE=0 N_FALLBACK=0 N_SKIPPED_TTY=0
+TOP_ROLE=none TOP_PID=0 TOP_KB=0 ROOT_IDS=""
 
 sample() {
-    local -A ppid_of=() comm_of=() kids_of=() seen=()
-    local -a roots=() queue=()
-    local d pid stat rest comm tag i j tmp
+    local -A ppid_of=() tty_of=() cmd_of=() kids_of=() seen=() is_a_root=()
+    local -a roots=() queue=() renderers=()
+    local d pid head tag row anc hops
 
-    TIER_KB=() DETAIL=()
-    SUM_PSS_KB=0 SUM_RSS_KB=0 N_PROCS=0 N_CLAUDE=0 N_FALLBACK=0
-    TOP_ROLE=- TOP_PID=0 TOP_KB=0 ROOT_IDS=-
+    TIER_KB=() DETAIL=() DETAIL_SORTED=0
+    SUM_PSS_KB=0 SUM_RSS_KB=0 N_PROCS=0 N_CLAUDE=0 N_FALLBACK=0 N_SKIPPED_TTY=0
+    TOP_ROLE=none TOP_PID=0 TOP_KB=0 ROOT_IDS=""
 
-    # Pass one: parent and name for every process. The comm field is
-    # parenthesised and may itself contain spaces or brackets, so the remainder
-    # is taken from the last ") " rather than by field index.
+    # Pass one: parent, tty, and the command line of anything that might belong
+    # to an editor. The /proc glob order is deterministic, so roots come out in
+    # a stable order without needing to be sorted afterwards.
     for d in /proc/[0-9]*; do
         pid=${d#/proc/}
-        stat=$(<"$d/stat") 2>/dev/null || continue
-        [[ -n $stat ]] || continue
-        rest=${stat##*\) }
-        rest=${rest#* }                 # drop state, leaving ppid first
-        ppid_of[$pid]=${rest%% *}
-        comm=${stat#*\(}
-        comm_of[$pid]=${comm%%\)*}
-    done
-
-    # Pass two: find the roots. Only processes whose name suggests a VS Code
-    # flavour are expanded, so this stays cheap on a busy machine.
-    for pid in "${!comm_of[@]}"; do
-        case "${comm_of[$pid]}" in
-            electron|code|code-oss|code-insiders|codium|vscodium|cursor|windsurf|node) ;;
-            *) continue ;;
-        esac
+        read_stat "$pid" || continue
+        ppid_of[$pid]=$P_PPID
+        tty_of[$pid]=$P_TTY
+        # [[ ]] parses extended patterns without needing shopt, which a
+        # case statement would require at parse time (breaking bash -n).
+        [[ $P_COMM == @($CANDIDATE_COMMS) ]] || continue
         read_cmdline "$pid"
         [[ -n $CMD ]] || continue
-        is_root "$CMD" "${comm_of[$pid]}" && roots+=("$pid")
+        cmd_of[$pid]=$CMD
+        case "$CMD" in
+            *--type=renderer*) renderers+=("$pid") ;;
+            # code-server and the remote server are plain node: no Chromium
+            # process types at all, so they are found by entry point instead.
+            *server-main.js*)
+                [[ $CMD != *--type=* ]] && { roots+=("$pid"); is_a_root[$pid]=1; } ;;
+        esac
+    done
+
+    # Roots are derived upward from renderers, because a renderer is the one
+    # thing only a real editor instance has. Deriving them downward instead --
+    # from zygotes, or by matching main-process command lines -- also catches
+    # every transient `code --wait` / `code --status` CLI invocation, which
+    # spawns Chromium children of its own and matches the same patterns a real
+    # main process does. Each phantom root changes the recorded run identity,
+    # and --report reads that as a restart and discards the growth curve.
+    for pid in "${renderers[@]}"; do
+        anc=${ppid_of[$pid]:-0} hops=0
+        while (( hops < 8 )) && [[ -n ${ppid_of[$anc]:-} ]]; do
+            if [[ -n ${cmd_of[$anc]:-} && ${cmd_of[$anc]} != *--type=* ]]; then
+                if [[ -z ${is_a_root[$anc]:-} ]]; then
+                    is_a_root[$anc]=1
+                    roots+=("$anc")
+                fi
+                break
+            fi
+            anc=${ppid_of[$anc]}
+            hops=$(( hops + 1 ))
+        done
     done
 
     ((${#roots[@]})) || return 0
-
-    # Insertion sort, so the recorded identity of a run is stable between
-    # samples regardless of the order bash walked the hash.
-    for ((i = 1; i < ${#roots[@]}; i++)); do
-        tmp=${roots[i]}
-        for ((j = i - 1; j >= 0 && roots[j] > tmp; j--)); do
-            roots[j + 1]=${roots[j]}
-        done
-        roots[j + 1]=$tmp
+    ROOT_EXES=()
+    for pid in "${roots[@]}"; do
+        ROOT_EXES[${cmd_of[$pid]%% *}]=1
     done
     printf -v ROOT_IDS '%s;' "${roots[@]}"
     ROOT_IDS=${ROOT_IDS%;}
-    local -A is_root=()
-    for pid in "${roots[@]}"; do is_root[$pid]=1; done
 
     for pid in "${!ppid_of[@]}"; do
         kids_of[${ppid_of[$pid]}]+=" $pid"
     done
 
-    # Pass three: breadth-first over the descendants of each root. Membership by
-    # descent rather than by command-line pattern is what makes this work on
-    # forks of VS Code that rename their directories and user-data paths.
-    # (The crash-handler process is reparented to init and so is not counted;
-    # it is a couple of megabytes.)
-    queue=("${roots[@]}")
-    while ((${#queue[@]})); do
-        pid=${queue[0]}
-        queue=("${queue[@]:1}")
+    # Pass two: breadth-first from each root. A head cursor, not an array
+    # slice: re-slicing the queue every dequeue is quadratic in tree size.
+    queue=("${roots[@]}") head=0
+    while (( head < ${#queue[@]} )); do
+        pid=${queue[head]}; head=$(( head + 1 ))
         [[ -n ${seen[$pid]:-} ]] && continue
         seen[$pid]=1
-        if [[ -n ${kids_of[$pid]:-} ]]; then
-            # shellcheck disable=SC2206  # deliberate split of the child list
-            queue+=(${kids_of[$pid]})
+
+        # A controlling terminal means an integrated-terminal process: the
+        # user's shell and whatever it is running. Not VS Code's memory.
+        if [[ ${tty_of[$pid]:-0} != 0 ]]; then
+            N_SKIPPED_TTY=$(( N_SKIPPED_TTY + 1 ))
+            continue
         fi
 
         read_cmdline "$pid"
         [[ -n $CMD ]] || continue
         read_mem "$pid"
         (( MEM_KB > 0 )) || continue
-        read_rss "$pid"
-        (( PSS_EXACT )) || N_FALLBACK=$(( N_FALLBACK + 1 ))
 
-        if [[ -n ${is_root[$pid]:-} ]]; then ROLE=main; else classify "$CMD"; fi
+        if [[ -n ${is_a_root[$pid]:-} ]]; then ROLE=main; else classify "$CMD"; fi
+
+        # Descend only through VS Code's own process types. An extension worker
+        # is counted; its children are its own business.
+        if is_internal_tier "$ROLE" && [[ -n ${kids_of[$pid]:-} ]]; then
+            # shellcheck disable=SC2206  # deliberate split of the child list
+            queue+=(${kids_of[$pid]})
+        fi
+
+        (( PSS_EXACT )) || N_FALLBACK=$(( N_FALLBACK + 1 ))
         SUM_PSS_KB=$(( SUM_PSS_KB + MEM_KB ))
         SUM_RSS_KB=$(( SUM_RSS_KB + RSS_KB ))
         N_PROCS=$(( N_PROCS + 1 ))
         TIER_KB[$ROLE]=$(( ${TIER_KB[$ROLE]:-0} + MEM_KB ))
         [[ $ROLE == claude ]] && N_CLAUDE=$(( N_CLAUDE + 1 ))
-
         if (( MEM_KB > TOP_KB )); then
             TOP_KB=$MEM_KB TOP_PID=$pid TOP_ROLE=$ROLE
         fi
@@ -253,33 +316,41 @@ sample() {
             *vscode-window-config=*) tag=window ;;
         esac
         (( PSS_EXACT )) || tag="${tag:+$tag }(rss estimate)"
-        printf -v tmp '%9d KB pss  %9d KB rss  %-10s pid=%-8s %s' \
+        printf -v row '%9d KB pss  %9d KB rss  %-10s pid=%-8s %s' \
             "$MEM_KB" "$RSS_KB" "$ROLE" "$pid" "$tag"
-        DETAIL+=("$tmp")
+        DETAIL+=("$row")
     done
-
-    # Largest first: the whole point is to see the offender at the top.
-    ((${#DETAIL[@]})) && mapfile -t DETAIL < <(printf '%s\n' "${DETAIL[@]}" | sort -rn)
     return 0
+}
+
+# Sorting is a fork, so it happens only when something is going to read the
+# detail — not on the ~1400 daily samples that never produce output.
+sort_detail() {
+    (( DETAIL_SORTED )) && return 0
+    ((${#DETAIL[@]})) && mapfile -t DETAIL < <(printf '%s\n' "${DETAIL[@]}" | sort -rn)
+    DETAIL_SORTED=1
 }
 
 # ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
 
-summary_head() {
-    printf 'VS Code tree: %d MB PSS (%d MB RSS) across %d processes, %d Claude session(s)\n' \
-        "$(( SUM_PSS_KB / 1024 ))" "$(( SUM_RSS_KB / 1024 ))" "$N_PROCS" "$N_CLAUDE"
-}
-
-summary_body() {
-    local t out=""
+# One emitter for both the --once view and the snapshot file, so the two cannot
+# drift apart in formatting.
+emit_report() {
+    local prefix="$1" t out=""
+    printf '%sVS Code tree: %d MB PSS (%d MB RSS) across %d processes, %d Claude session(s)\n' \
+        "$prefix" "$(( SUM_PSS_KB / 1024 ))" "$(( SUM_RSS_KB / 1024 ))" "$N_PROCS" "$N_CLAUDE"
     for t in "${TIERS[@]}"; do
         (( ${TIER_KB[$t]:-0} )) && out+="$t=$(( TIER_KB[$t] / 1024 ))MB "
     done
-    printf '%s\n' "${out% }"
-    printf 'largest: %s pid=%s at %d MB\n' "$TOP_ROLE" "$TOP_PID" "$(( TOP_KB / 1024 ))"
-    (( N_FALLBACK )) && printf 'note: %d process(es) had no readable smaps_rollup; RSS used instead\n' "$N_FALLBACK"
+    printf '%s  %s\n' "$prefix" "${out% }"
+    printf '%s  largest: %s pid=%s at %d MB\n' \
+        "$prefix" "$TOP_ROLE" "$TOP_PID" "$(( TOP_KB / 1024 ))"
+    (( N_SKIPPED_TTY )) && printf '%s  (%d integrated-terminal process(es) excluded)\n' \
+        "$prefix" "$N_SKIPPED_TTY"
+    (( N_FALLBACK )) && printf '%s  note: %d process(es) had no readable smaps_rollup; RSS used\n' \
+        "$prefix" "$N_FALLBACK"
     return 0
 }
 
@@ -310,7 +381,7 @@ vscode-memory-watch $VERSION — find out which VS Code process is eating your R
   vscode-memory-watch --help     this text
   vscode-memory-watch --version
 
-Environment:
+Environment (all must be positive integers):
   VSCODE_MEM_INTERVAL    seconds between samples          (default $INTERVAL)
   VSCODE_MEM_WARN_TOTAL  whole-tree PSS warning line, MB  (default $WARN_TOTAL_MB)
   VSCODE_MEM_WARN_PROC   single-process PSS line, MB      (default $WARN_PROC_MB)
@@ -324,70 +395,90 @@ case "${1:-}" in
     --once)
         sample
         if (( N_PROCS == 0 )); then
-            echo "No VS Code process tree found. Looked for a main process of:" >&2
+            echo "No VS Code process tree found. Looked for the main process of" >&2
             echo "VS Code, Code - OSS, VSCodium, Cursor, Windsurf or code-server." >&2
             exit 1
         fi
-        summary_head
-        summary_body | sed 's/^/  /'
+        sort_detail
+        emit_report ""
         echo
         printf '%s\n' "${DETAIL[@]}"
         exit 0 ;;
     --report)
         [[ -s $HISTORY ]] || { echo "no history yet: $HISTORY" >&2; exit 1; }
-        exec awk -F, -v interval="$INTERVAL" '
-            NR == 1 {
+        # Read twice: once to learn the sampling cadence the data was actually
+        # written at, once to report. Taking the interval from this shell's
+        # environment instead would let the reporting shell change the headline
+        # growth rate by a multiple.
+        exec awk -F, '
+            FNR == 1 {
                 for (i = 1; i <= NF; i++) { idx[$i] = i; name[i] = $i }
                 ncol = NF
-                # Columns are looked up by name so tiers can be added without
-                # touching this code, but the few the logic depends on have to
-                # be there. An older log predating a schema change lands here.
-                if (!("epoch" in idx) || !("root_pids" in idx) || \
-                    !("total_pss_mb" in idx)) {
+                if (!("epoch" in idx) || !("root_pids" in idx) ||
+                    !("total_pss_mb" in idx) || !("renderer_mb" in idx)) {
                     print "history file has an unrecognised header; it predates" > "/dev/stderr"
                     print "this version. Move it aside and let a new one start." > "/dev/stderr"
-                    bad = 1
-                    exit 2
+                    bad = 1; exit 2
                 }
                 next
             }
+            NF != ncol { next }              # truncated row (unclean shutdown)
+
+            # First pass: the nominal cadence is the smallest gap between
+            # consecutive samples; anything larger is downtime.
+            NR == FNR {
+                if (pe > 0) { d = $(idx["epoch"]) - pe; if (d > 0 && (step == 0 || d < step)) step = d }
+                pe = $(idx["epoch"])
+                next
+            }
+
             {
-                # A new run starts when the set of main processes changes, and
-                # only then. That is the one signal that actually means the heap
-                # under observation was thrown away. Testing the total instead
-                # would misfire every time somebody closed a few heavy tabs, and
-                # splitting on a gap in the log would discard the whole curve
-                # every time the machine slept — on a laptop that is nightly,
-                # and the memory survives sleep, so the run genuinely continues.
+                if (step <= 0) step = 60
                 gap = (prev_epoch > 0) ? $(idx["epoch"]) - prev_epoch : 0
-                if (n > 0 && $(idx["root_pids"]) != prev_roots) { n = 0; gaps = 0 }
-                # Gaps are still excluded from the rate: hours the watcher was
-                # not running are hours the tree cannot be said to have grown in.
-                else if (gap > 5 * interval) gaps += gap - interval
+                # A run ends when the heap under observation was thrown away.
+                # Two things do that: the main process set changing (VS Code
+                # restarted), or the renderer tier collapsing (a window reload,
+                # which leaves the main process untouched — so root pids alone
+                # would miss the single most common case).
+                reload = (n > 0 && prev_rend > 200 && \
+                          $(idx["renderer_mb"]) < prev_rend / 2)
+                if (n > 0 && ($(idx["root_pids"]) != prev_roots || reload)) {
+                    n = 0; gaps = 0
+                    if (reload) reloads++
+                } else if (gap > 5 * step) {
+                    # Not a restart: memory survives sleep, so the run
+                    # continues. But hours the watcher was not running are not
+                    # hours the tree grew in, so they leave the denominator.
+                    gaps += gap - step
+                }
                 prev_roots = $(idx["root_pids"]); prev_epoch = $(idx["epoch"])
+                prev_rend = $(idx["renderer_mb"])
 
                 n++
                 if (n == 1) {
                     t0 = $1; e0 = $(idx["epoch"])
-                    # Reset the peaks too: carrying them across a restart would
-                    # report an old run high-water mark against a new run.
+                    # Peaks reset with the run: an old high-water mark reported
+                    # against a new run is worse than no peak at all.
                     for (i = 1; i <= ncol; i++) { first[i] = $i; peak[i] = $i }
                 }
                 for (i = 1; i <= ncol; i++) {
                     last[i] = $i
                     if ($i + 0 > peak[i] + 0) peak[i] = $i
                 }
+                if ($(idx["pss_fallback"]) + 0 > 0) fallbacks++
                 t1 = $1; e1 = $(idx["epoch"]); samples = n
             }
             END {
                 if (bad) exit 2
                 if (samples == 0) { print "no samples in current run"; exit 1 }
-                printf "current run: %s -> %s (%d samples, %d min)\n\n", \
+                printf "current run: %s -> %s (%d samples, %d min", \
                     t0, t1, samples, (e1 - e0) / 60 + 0.5
+                if (reloads > 0) printf ", %d window reload(s) ago", reloads
+                printf ")\n\n"
                 printf "%-12s %10s %10s %10s %11s\n", "tier", "start", "now", "peak", "growth"
                 for (i = 1; i <= ncol; i++) {
-                    # top_mb is the largest single process, not a tier of its
-                    # own; listing it here would double-count it in the table.
+                    # top_mb is the largest single process, not a tier; listing
+                    # it here would double-count it against the tiers.
                     if (name[i] !~ /_mb$/ || name[i] == "top_mb") continue
                     label = name[i]; sub(/_mb$/, "", label)
                     if (first[i] + 0 == 0 && peak[i] + 0 == 0) continue
@@ -400,9 +491,9 @@ case "${1:-}" in
                 printf "largest process now: %s pid %s at %d MB (peak %d MB)\n", \
                     last[idx["top_role"]], last[idx["top_pid"]], \
                     last[idx["top_mb"]], peak[idx["top_mb"]]
-                if (last[idx["pss_fallback"]] + 0 > 0)
-                    printf "note: %d process(es) in the last sample fell back to RSS\n", \
-                        last[idx["pss_fallback"]]
+                if (fallbacks > 0)
+                    printf "note: %d sample(s) in this run fell back to RSS for at least one process\n", \
+                        fallbacks
                 hours = (e1 - e0 - gaps) / 3600
                 if (hours > 0.5) {
                     printf "tree growth rate: %+.0f MB/hour", \
@@ -411,26 +502,42 @@ case "${1:-}" in
                     printf "\n"
                 }
             }
-        ' "$HISTORY" ;;
+        ' "$HISTORY" "$HISTORY" ;;
     "") ;;
     *)  echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
 esac
 
 mkdir -p "$STATE_DIR" "$SNAP_DIR"
-[[ -s $HISTORY ]] || csv_header >"$HISTORY"
+
+# The tier list is the schema. If it has changed since this log was started,
+# rotate rather than append rows that no longer match their own header — a
+# mismatched row is read as another tier's numbers, silently.
+want_header=$(csv_header)
+if [[ -s $HISTORY ]]; then
+    IFS= read -r have_header <"$HISTORY"
+    if [[ $have_header != "$want_header" ]]; then
+        mv -f "$HISTORY" "$HISTORY.$(printf '%(%Y%m%dT%H%M%S)T' -1).old"
+        printf '%s\n' "$want_header" >"$HISTORY"
+        echo "history schema changed; previous log moved aside" >&2
+    fi
+else
+    printf '%s\n' "$want_header" >"$HISTORY"
+fi
 
 if [[ ! -r /proc/self/smaps_rollup ]]; then
     echo "warning: /proc/self/smaps_rollup unreadable; falling back to RSS, which" >&2
-    echo "         overstates a shared-memory process tree. Figures are approximate." >&2
+    echo "         overstates a shared-memory process tree. Figures approximate." >&2
 fi
 
+# Survives a restart, so a crash-looping unit cannot re-notify every 10s.
 last_notify=0
-while :; do
-    if [[ -s $HISTORY ]] && (( $(stat -c %s "$HISTORY" 2>/dev/null || echo 0) > MAX_HISTORY_BYTES )); then
-        mv -f "$HISTORY" "$HISTORY.1"
-        csv_header >"$HISTORY"
-    fi
+[[ -r $NOTIFY_STAMP ]] && read -r last_notify <"$NOTIFY_STAMP" 2>/dev/null
+[[ $last_notify == +([0-9]) ]] || last_notify=0
 
+rows=$(( $(wc -l <"$HISTORY" 2>/dev/null || echo 1) - 1 ))
+run_peak_total=0 run_peak_proc=0
+
+while :; do
     sample
 
     # Nothing running: don't fill the log with rows of zeros.
@@ -440,28 +547,43 @@ while :; do
     fi
 
     csv_row >>"$HISTORY"
+    rows=$(( rows + 1 ))
+    if (( rows > MAX_HISTORY_ROWS )); then
+        mv -f "$HISTORY" "$HISTORY.1"
+        printf '%s\n' "$want_header" >"$HISTORY"
+        rows=0
+    fi
 
     total_mb=$(( SUM_PSS_KB / 1024 ))
     top_mb=$(( TOP_KB / 1024 ))
     printf -v now '%(%s)T' -1
 
-    if (( total_mb >= WARN_TOTAL_MB || top_mb >= WARN_PROC_MB )) \
-       && (( now - last_notify >= NOTIFY_COOLDOWN )); then
+    # Snapshot on a new high, not merely on crossing the line once: the point
+    # is to capture the peak, and the cooldown would otherwise freeze the
+    # evidence at whatever the tree looked like when it first crossed.
+    if (( (total_mb >= WARN_TOTAL_MB || top_mb >= WARN_PROC_MB)
+          && (total_mb > run_peak_total || top_mb > run_peak_proc) )); then
+        run_peak_total=$(( total_mb > run_peak_total ? total_mb : run_peak_total ))
+        run_peak_proc=$(( top_mb > run_peak_proc ? top_mb : run_peak_proc ))
+
         printf -v snap_stamp '%(%Y%m%dT%H%M%S)T' -1
         snap="$SNAP_DIR/$snap_stamp.txt"
+        sort_detail
         {
             printf '# vscode-memory-watch %s snapshot %(%Y-%m-%dT%H:%M:%S%z)T\n' "$VERSION" -1
-            printf '# %s' "$(summary_head)"
-            summary_body | sed 's/^/# /'
+            emit_report '# '
             echo
             printf '%s\n' "${DETAIL[@]}"
         } >"$snap"
 
-        notify-send -u critical -a "VS Code memory" \
-            "VS Code at ${total_mb} MB" \
-            "Largest: ${TOP_ROLE} (pid ${TOP_PID}) at ${top_mb} MB. ${N_CLAUDE} Claude session(s) open. Snapshot: ${snap}" \
-            2>/dev/null
-        last_notify=$now
+        if (( now - last_notify >= NOTIFY_COOLDOWN )); then
+            notify-send -u critical -a "VS Code memory" \
+                "VS Code at ${total_mb} MB" \
+                "Largest: ${TOP_ROLE} (pid ${TOP_PID}) at ${top_mb} MB. ${N_CLAUDE} Claude session(s) open. Snapshot: ${snap}" \
+                2>/dev/null
+            last_notify=$now
+            printf '%s\n' "$now" >"$NOTIFY_STAMP"
+        fi
     fi
 
     sleep "$INTERVAL"
