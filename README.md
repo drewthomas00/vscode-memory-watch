@@ -7,7 +7,8 @@ balloons to 15–20 GB and you reload it to stay sane, you learn nothing: the pr
 leaking is gone. This samples the tree on an interval and records memory *per tier*, so the tier
 that climbs names itself, and it captures a full per-process snapshot at the moment things go bad.
 
-It found a real bug in under four hours. See [What it found](#what-it-found).
+Four hours of sampling pinned a months-old "VS Code is eating 20 GB" problem to a single webview
+process — independently confirming an upstream bug. See [What it found](#what-it-found).
 
 ## Usage
 
@@ -26,8 +27,8 @@ VS Code tree: 9589 MB PSS (12622 MB RSS) across 38 processes, 9 Claude session(s
 ```
 
 `vscode-memory-watch --report` prints the same tiers as a growth table — start, now, peak and
-delta for each — since VS Code last started. That's the view that identifies a leak, and there's a
-real one in [What it found](#what-it-found).
+delta for each — since the current run started (an editor restart or a window reload begins a new
+run). That's the view that identifies a leak, and there's a real one in [What it found](#what-it-found).
 
 Run with no arguments to sample continuously. `--help` lists everything.
 
@@ -40,7 +41,7 @@ systemctl --user daemon-reload
 systemctl --user enable --now vscode-memory-watch.service
 ```
 
-Needs **bash 4.2+** (for `printf '%()T'`), awk, coreutils and Linux `/proc`. `notify-send` is
+Needs **bash 4.2+** (for `printf '%()T'`), awk, coreutils, getconf and Linux `/proc`. `notify-send` is
 optional — without it the snapshot is still written, you just don't get the desktop alert.
 
 ## How it finds the tree
@@ -53,15 +54,22 @@ main process does. Identifying roots by pattern instead adopts those as extra in
 a change in the set of main processes is what ends a run, a routine `git commit` would silently
 discard hours of accumulated growth curve.
 
+The owner it walks up to must itself look like an editor — named like one, or carrying a VS Code
+entry point in its command line. Every Electron app has renderers, and without that check a
+Signal or Obsidian running on the system `electron` binary would be adopted as a "VS Code"
+instance, merged into every total, and its exit would end the recorded run.
+
 Working from the tree rather than from install paths is also what keeps it working across VS Code,
 Code - OSS, VSCodium, Cursor, Windsurf and code-server, none of which agree on where they live or
 what they call their user-data directory.
 
 **The walk is bounded.** It descends through VS Code's own process types and stops at anything
-else, and it skips any process with a controlling terminal. So an extension's language server is
-counted, but the `cargo build` you started in the integrated terminal is not — that is your memory,
-not VS Code's, and sweeping it in would both inflate the headline and fire alerts naming the wrong
-thing. Excluded terminal processes are counted and reported so you know they were left out.
+else, and it skips any process with a controlling terminal — except the terminal the editor itself
+was launched from, so a `code` or code-server started from a shell is still found. An extension's
+language server is counted, but the `cargo build` you started in the integrated terminal is not —
+that is your memory, not VS Code's, and sweeping it in would both inflate the headline and fire
+alerts naming the wrong thing. Excluded terminal processes are counted and reported so you know
+they were left out.
 
 Processes are then classified into tiers by command line, because every Chromium tier is the same
 binary under the same name:
@@ -76,7 +84,7 @@ binary under the same name:
 | `helper` | anything else an extension spawned: tool servers, language runtimes |
 | `utility`, `gpu`, `main`, `zygote` | the rest of the Electron tree |
 
-Splitting `exthost` from `nodeutil` matters more than it sounds: the extension host, shared
+Splitting `exthost` from `nodeutil` is not cosmetic: the extension host, shared
 process, pty host and file watcher are *all* `--type=utility --utility-sub-type=node.mojom.NodeService`
 with near-identical command lines. Only the extension host is started with a debug port, which is
 what separates it here. Without that split, a pty-host leak gets reported as extension-host growth.
@@ -84,8 +92,8 @@ what separates it here. Without that split, a pty-host leak gets reported as ext
 ## Why PSS
 
 **It reports PSS, not RSS.** RSS counts every shared mapping once per process, so summing it
-across a 40-process Electron tree overstates real usage badly — 12.0 GB RSS against 9.0 GB PSS in
-the example above. PSS divides each shared page among the processes mapping it, so the tiers
+across a 40-process Electron tree overstates real usage badly — 12622 MB RSS against 9589 MB PSS
+in the example above. PSS divides each shared page among the processes mapping it, so the tiers
 actually add up to the total.
 
 Where `smaps_rollup` can't be read — a process exiting mid-sample, or a kernel built without
@@ -115,11 +123,12 @@ terminal's processes.
 When the tree crosses `12000` MB PSS, or any single process crosses `4000` MB, it sends a desktop
 notification and writes a full per-process snapshot to `snapshots/`.
 
-The snapshot is rewritten on every **new high**, not just the first crossing — otherwise the
-notification cooldown would freeze the evidence at whatever the tree looked like when it first
-crossed the line, which is not the peak and not what you want to paste into a bug report.
-Notifications themselves stay rate-limited to one per 30 minutes, and that limit persists across
-restarts so a crash-looping service can't spam you.
+One snapshot file per run, rewritten on every **new high** — not just the first crossing,
+because the notification cooldown would otherwise freeze the evidence at whatever the tree looked
+like when it first crossed the line, which is not the peak and not what you want to paste into a
+bug report. The peak tracker resets when the run does, so day two's smaller-but-still-huge leak
+isn't silenced by day one's record. Notifications themselves stay rate-limited to one per 30
+minutes, and that limit persists across restarts so a crash-looping service can't spam you.
 
 | variable | default | meaning |
 |---|---|---|
@@ -145,9 +154,10 @@ common case by far, and the one a main-PID check alone would miss). Reloads are 
 
 It deliberately does *not* split on a gap in the log: a laptop that sleeps overnight leaves a gap,
 but the memory survives sleep and the run genuinely continues. Gaps are excluded from the
-growth-rate denominator instead, and reported. The sampling cadence used for that is measured from
-the data, not read from your environment — otherwise the shell you happen to run `--report` from
-could change the headline growth rate by a multiple.
+growth-rate denominator instead, and reported. The sampling cadence used for that is the *modal*
+gap between samples, measured from the data — not the smallest gap, which one quick daemon restart
+would poison, and not your environment, which would let the shell you happen to run `--report`
+from change the headline growth rate by a multiple.
 
 ## What it found
 
@@ -174,24 +184,30 @@ processes: 30 -> 31   claude sessions: 4 -> 8
 tree growth rate: +1155 MB/hour
 ```
 
-*(Verbatim v1.0 output — the version that was running during the investigation. v1.1 splits
-`nodeutil` out of `exthost` and `helper` out of `other`; the raw samples behind it are in
-`examples/history-incident-v1.csv`.)*
+*(Verbatim v1.0 output — the version running during the investigation; the script shipped here is
+v2.0.0, which splits `nodeutil` out of `exthost` and `helper` out of `other`, among other fixes.
+The excerpt covers the first 238 of the 296 samples in `examples/history-incident-v1.csv` — the
+log continues another hour with the same pattern.)*
 
-A **single webview renderer process** grew 924 MB → 5317 MB (~1.1 GB/hour), while every other tier
-stayed flat or sawtoothed normally under garbage collection. The extension host netted **+61 MB**
-over the same window despite peaking at 2388 MB; tsserver peaked at 1784 MB and came back down to
-490 MB. At peak, one renderer held 4.2 GB while the next largest process in the tree held 498 MB.
+The **renderer tier** grew 924 MB → 5317 MB (~1.1 GB/hour), and the growth was one process: the
+CSV's top-process column shows the webview renderer climbing 503 MB → 4796 MB while the editor
+windows' own renderers stayed in the 250–320 MB range. Every other tier either scaled with session
+count (`claude`, 4 → 8 tabs) or sawtoothed normally under garbage collection: the extension host
+netted **+61 MB** over the window despite peaking at 2388 MB, and tsserver peaked at 1784 MB and
+came back down to 490 MB. In the snapshot captured as the tree crossed the alert line
+(`examples/snapshot-incident-v1.txt`), that one renderer held 4097 MB PSS while the next largest
+process in the tree held 486 MB.
 
-That's [anthropics/claude-code#84013](https://github.com/anthropics/claude-code/issues/84013): the
-Claude Code conversation webview retains all rendered history, and neither `/compact` nor closing
-session tabs releases it.
+That matches [anthropics/claude-code#84013](https://github.com/anthropics/claude-code/issues/84013),
+reported upstream independently a week earlier: the Claude Code conversation webview retains all
+rendered history, and neither `/compact` nor closing session tabs releases it.
 
 The per-tier split is the whole point. "VS Code is using 20 GB" is not actionable. "One webview
-renderer is using 4.2 GB while the next largest process is 498 MB, and the extension host holding
+renderer is using 4.1 GB while the next largest process is 486 MB, and the extension host holding
 the same conversation data nets +61 MB over four hours" is a bug report.
 
-`examples/` has the raw samples, the snapshot captured at peak, and current-version output.
+`examples/` has the raw samples, the snapshot captured during the incident, and current-version
+output.
 
 ## License
 

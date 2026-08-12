@@ -1,43 +1,43 @@
-VS Code tree: 9589 MB PSS (12622 MB RSS) across 38 processes, 9 Claude session(s)
-  renderer=4942MB exthost=497MB claude=2417MB tsserver=346MB langserver=350MB helper=191MB nodeutil=567MB utility=21MB gpu=83MB main=155MB zygote=13MB
-  largest: renderer pid=3369519 at 4360 MB
+VS Code tree: 10286 MB PSS (13330 MB RSS) across 38 processes, 9 Claude session(s)
+  renderer=5587MB exthost=577MB claude=2481MB tsserver=243MB langserver=355MB helper=192MB nodeutil=571MB utility=21MB gpu=84MB main=158MB zygote=13MB
+  largest: renderer pid=3369519 at 4977 MB
   (4 integrated-terminal process(es) excluded)
 
-  4465437 KB pss    4576384 KB rss  renderer   pid=3369519  window
-   439848 KB pss     513072 KB rss  nodeutil   pid=3369526  
-   336143 KB pss     458388 KB rss  claude     pid=3380222  session=e6e314ca-f038-44a1-8966-6bed829acd46
-   326732 KB pss     447744 KB rss  claude     pid=3372538  session=55322f72-2988-4235-a7b2-20b35822b51a
-   320433 KB pss     443644 KB rss  renderer   pid=1313239  window
-   315423 KB pss     436676 KB rss  claude     pid=1193421  
-   315317 KB pss     435884 KB rss  claude     pid=3373316  
-   314124 KB pss     436308 KB rss  claude     pid=3379966  session=e58f7834-5291-4807-8a75-3c3597dbfdc6
-   290013 KB pss     388156 KB rss  exthost    pid=3369496  
-   288383 KB pss     409108 KB rss  claude     pid=1146880  
-   275666 KB pss     395832 KB rss  renderer   pid=1313231  window
-   265727 KB pss     329136 KB rss  tsserver   pid=3403288  
-   219556 KB pss     315480 KB rss  exthost    pid=3373100  
-   216241 KB pss     327056 KB rss  claude     pid=1136833  session=9c422134-5cea-418a-961b-bdf6313599a0
-   181978 KB pss     290600 KB rss  claude     pid=2620785  session=8fd9d7a9-0061-4675-92ee-2368b9174bc3
-   181494 KB pss     289328 KB rss  claude     pid=1146234  
-   172850 KB pss     178524 KB rss  helper     pid=128257   
-   159096 KB pss     312056 KB rss  main       pid=1313087  
-    89558 KB pss     152896 KB rss  tsserver   pid=3403287  
-    85928 KB pss     206852 KB rss  gpu        pid=1313157  
-    64229 KB pss     129292 KB rss  langserver pid=1200075  
-    51155 KB pss     124720 KB rss  nodeutil   pid=1319008  
-    47652 KB pss      62640 KB rss  langserver pid=3373428  
-    46629 KB pss     122048 KB rss  nodeutil   pid=1319011  
-    43855 KB pss     116652 KB rss  nodeutil   pid=3373122  
-    39684 KB pss     103028 KB rss  langserver pid=3538809  
-    36795 KB pss     100424 KB rss  langserver pid=3439492  
-    35855 KB pss      99024 KB rss  langserver pid=3373304  
-    34634 KB pss      99808 KB rss  langserver pid=3883603  
-    26182 KB pss      89124 KB rss  langserver pid=4077088  
-    25651 KB pss      88896 KB rss  langserver pid=3370014  
-    25162 KB pss      88172 KB rss  langserver pid=3369957  
-    23581 KB pss      81412 KB rss  helper     pid=4077089  
-    23043 KB pss      81300 KB rss  langserver pid=3373266  
-    21967 KB pss      81220 KB rss  utility    pid=1313160  
-     7052 KB pss      50216 KB rss  zygote     pid=1313090  
-     3773 KB pss      49700 KB rss  zygote     pid=1313091  
-     2696 KB pss      15028 KB rss  zygote     pid=1313093  
+  5097182 KB pss    5208748 KB rss  renderer   pid=3369519  window
+   443025 KB pss     516260 KB rss  nodeutil   pid=3369526
+   364089 KB pss     486120 KB rss  claude     pid=1193421
+   359799 KB pss     458016 KB rss  exthost    pid=3369496
+   342914 KB pss     465292 KB rss  claude     pid=3379966  session=e58f7834-5291-4807-8a75-3c3597dbfdc6
+   336144 KB pss     458508 KB rss  claude     pid=3380222  session=e6e314ca-f038-44a1-8966-6bed829acd46
+   333954 KB pss     457160 KB rss  renderer   pid=1313239  window
+   321122 KB pss     442244 KB rss  claude     pid=3372538  session=55322f72-2988-4235-a7b2-20b35822b51a
+   310326 KB pss     431512 KB rss  claude     pid=3373316
+   290684 KB pss     410824 KB rss  renderer   pid=1313231  window
+   285007 KB pss     405832 KB rss  claude     pid=1146880
+   232053 KB pss     330408 KB rss  exthost    pid=3373100
+   216359 KB pss     327180 KB rss  claude     pid=1136833  session=9c422134-5cea-418a-961b-bdf6313599a0
+   182607 KB pss     291344 KB rss  claude     pid=2620785  session=8fd9d7a9-0061-4675-92ee-2368b9174bc3
+   182037 KB pss     289876 KB rss  claude     pid=1146234
+   173703 KB pss     179376 KB rss  helper     pid=128257
+   162085 KB pss     315112 KB rss  main       pid=1313087
+   156008 KB pss     219428 KB rss  tsserver   pid=3403288
+    92943 KB pss     156292 KB rss  tsserver   pid=3403287
+    86676 KB pss     207816 KB rss  gpu        pid=1313157
+    64181 KB pss     129292 KB rss  langserver pid=1200075
+    51381 KB pss     124956 KB rss  nodeutil   pid=1319008
+    47670 KB pss      62644 KB rss  langserver pid=3373428
+    45726 KB pss     121156 KB rss  nodeutil   pid=1319011
+    44867 KB pss     117676 KB rss  nodeutil   pid=3373122
+    40590 KB pss     103944 KB rss  langserver pid=3538809
+    37604 KB pss     101244 KB rss  langserver pid=3439492
+    35841 KB pss      99020 KB rss  langserver pid=3373304
+    34761 KB pss      99984 KB rss  langserver pid=3883603
+    27547 KB pss      90568 KB rss  langserver pid=3369957
+    26331 KB pss      89284 KB rss  langserver pid=4077088
+    25861 KB pss      89116 KB rss  langserver pid=3370014
+    23764 KB pss      81596 KB rss  helper     pid=4077089
+    23404 KB pss      86100 KB rss  langserver pid=3373266
+    21889 KB pss      81156 KB rss  utility    pid=1313160
+     7050 KB pss      50212 KB rss  zygote     pid=1313090
+     3767 KB pss      49692 KB rss  zygote     pid=1313091
+     2696 KB pss      15028 KB rss  zygote     pid=1313093

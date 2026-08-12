@@ -1,19 +1,20 @@
-current run: 2026-08-11T23:40:55-0400 -> 2026-08-11T23:49:00-0400 (9 samples, 8 min)
+current run: 2026-08-12T00:18:18-0400 -> 2026-08-12T01:28:01-0400 (70 samples, 70 min)
 
 tier              start        now       peak      growth
-total_pss        9225 MB     9027 MB     9230 MB      -198 MB
-total_rss       12247 MB    12036 MB    12247 MB      -211 MB
-renderer         4539 MB     4582 MB     4582 MB       +43 MB
-exthost           536 MB      528 MB      536 MB        -8 MB
-claude           2168 MB     2160 MB     2184 MB        -8 MB
-tsserver          533 MB      355 MB      533 MB      -178 MB
-langserver        329 MB      324 MB      330 MB        -5 MB
-helper            234 MB      232 MB      234 MB        -2 MB
-nodeutil          611 MB      573 MB      612 MB       -38 MB
+total_pss        9709 MB    10310 MB    10466 MB      +601 MB
+total_rss       12854 MB    13353 MB    13504 MB      +499 MB
+renderer         4935 MB     5573 MB     5717 MB      +638 MB
+exthost           553 MB      618 MB      697 MB       +65 MB
+claude           2410 MB     2475 MB     2475 MB       +65 MB
+tsserver          397 MB      247 MB      533 MB      -150 MB
+langserver        323 MB      355 MB      355 MB       +32 MB
+helper            236 MB      192 MB      236 MB       -44 MB
+nodeutil          577 MB      570 MB      621 MB        -7 MB
 utility            21 MB       21 MB       21 MB        +0 MB
-gpu                84 MB       83 MB       84 MB        -1 MB
-main              152 MB      152 MB      152 MB        +0 MB
+gpu                84 MB       84 MB       85 MB        +0 MB
+main              155 MB      158 MB      159 MB        +3 MB
 zygote             13 MB       13 MB       13 MB        +0 MB
 
-processes: 45 -> 42   claude sessions: 8 -> 8
-largest process now: renderer pid 3369519 at 4014 MB (peak 4019 MB)
+processes: 46 -> 38   claude sessions: 9 -> 9
+largest process now: renderer pid 3369519 at 4969 MB (peak 5124 MB)
+tree growth rate: +517 MB/hour

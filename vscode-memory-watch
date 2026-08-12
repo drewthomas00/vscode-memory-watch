@@ -18,32 +18,38 @@
 
 set -u
 
-readonly VERSION=2.0.0
+readonly VERSION=2.1.0
 
 readonly STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/vscode-memory-watch"
 readonly HISTORY="$STATE_DIR/history.csv"
 readonly SNAP_DIR="$STATE_DIR/snapshots"
 readonly NOTIFY_STAMP="$STATE_DIR/last-notify"
 
-readonly INTERVAL="${VSCODE_MEM_INTERVAL:-60}"
-readonly WARN_TOTAL_MB="${VSCODE_MEM_WARN_TOTAL:-12000}"
-readonly WARN_PROC_MB="${VSCODE_MEM_WARN_PROC:-4000}"
-readonly NOTIFY_COOLDOWN="${VSCODE_MEM_COOLDOWN:-1800}"
+INTERVAL="${VSCODE_MEM_INTERVAL:-60}"
+WARN_TOTAL_MB="${VSCODE_MEM_WARN_TOTAL:-12000}"
+WARN_PROC_MB="${VSCODE_MEM_WARN_PROC:-4000}"
+NOTIFY_COOLDOWN="${VSCODE_MEM_COOLDOWN:-1800}"
 readonly MAX_HISTORY_ROWS=40000          # ~28 days at the 60s default
 
 # Every one of these reaches an arithmetic context, where bash would evaluate
 # its contents as an expression — `TIER_KB[$(...)]` in an env var is command
-# execution. Validate before anything else touches them.
+# execution. Validate before anything else touches them. The length cap keeps
+# the value far from 2^63, where bash arithmetic wraps silently; the 10# below
+# keeps a leading zero from being read as octal ('08' is an error, '020000'
+# is 8192).
 for _pair in INTERVAL:VSCODE_MEM_INTERVAL WARN_TOTAL_MB:VSCODE_MEM_WARN_TOTAL \
              WARN_PROC_MB:VSCODE_MEM_WARN_PROC NOTIFY_COOLDOWN:VSCODE_MEM_COOLDOWN; do
     _name=${_pair%%:*}
-    if [[ ${!_name} != +([0-9]) || ${!_name} == +(0) ]]; then
-        printf '%s: %s must be a positive integer (got %q)\n' \
-            "${0##*/}" "${_pair#*:}" "${!_name}" >&2
+    _val=${!_name}
+    if [[ $_val != +([0-9]) || $_val == +(0) || ${#_val} -gt 10 ]]; then
+        printf '%s: %s must be a positive integer of at most 10 digits (got %q)\n' \
+            "${0##*/}" "${_pair#*:}" "$_val" >&2
         exit 2
     fi
+    printf -v "$_name" '%s' "$(( 10#$_val ))"
 done
-unset _pair _name
+unset _pair _name _val
+readonly INTERVAL WARN_TOTAL_MB WARN_PROC_MB NOTIFY_COOLDOWN
 
 # statm counts pages, and the page size is not 4K everywhere: arm64 kernels are
 # commonly built with 16K pages, which would make every figure four times low.
@@ -109,12 +115,12 @@ read_mem() {
 # spaces or brackets, so the remainder is taken from the last ") ".
 P_PPID=0 P_TTY=0 P_COMM=""
 read_stat() {
-    local stat rest
+    local stat="" rest
     P_PPID=0 P_TTY=0 P_COMM=""
-    # A command substitution performs its own redirection before any applied to
-    # the enclosing command, so `$(<f) 2>/dev/null` still prints. Wrapping in a
-    # group is what actually silences the vanished-process races.
-    { stat=$(<"/proc/$1/stat"); } 2>/dev/null
+    # A plain `read` rather than `$(<...)`: stat is a single line, and $(<file)
+    # forks a subshell on every bash before 5.2 — which, run once per PID on
+    # the system, would be the script's entire fork budget on older distros.
+    IFS= read -r stat 2>/dev/null <"/proc/$1/stat"
     [[ -n $stat ]] || return 1
     P_COMM=${stat#*\(}; P_COMM=${P_COMM%%\)*}
     rest=${stat##*\) }
@@ -183,6 +189,20 @@ classify_worker() {
     esac
 }
 
+# A renderer's owner must itself look like an editor before it is adopted as
+# a root. Every Electron app has renderers: without this gate, Signal or
+# Obsidian running on the system electron binary would be adopted as a
+# "VS Code" instance, merged into every total, and its exit would end the
+# recorded run. Editors name themselves in comm; anything hiding behind a
+# generic `electron`/`node` comm must carry a VS Code entry point.
+is_editor_main() {   # $1 = comm, $2 = command line
+    [[ $1 == @($FLAVOUR_COMMS) ]] && return 0
+    case "$2" in
+        *code.mjs*|*server-main.js*|*out/vs/code*) return 0 ;;
+    esac
+    return 1
+}
+
 # True for the Chromium tiers that make up VS Code itself. The walk descends
 # through these and stops at anything else, so an extension's worker is counted
 # but whatever that worker goes on to run is not. A build in the integrated
@@ -206,9 +226,10 @@ SUM_PSS_KB=0 SUM_RSS_KB=0 N_PROCS=0 N_CLAUDE=0 N_FALLBACK=0 N_SKIPPED_TTY=0
 TOP_ROLE=none TOP_PID=0 TOP_KB=0 ROOT_IDS=""
 
 sample() {
-    local -A ppid_of=() tty_of=() cmd_of=() kids_of=() seen=() is_a_root=()
+    local -A ppid_of=() tty_of=() cmd_of=() comm_of=() kids_of=() seen=()
+    local -A is_a_root=() root_ttys=()
     local -a roots=() queue=() renderers=()
-    local d pid head tag row anc hops
+    local d pid head tag row anc hops i j tmp t
 
     TIER_KB=() DETAIL=() DETAIL_SORTED=0
     SUM_PSS_KB=0 SUM_RSS_KB=0 N_PROCS=0 N_CLAUDE=0 N_FALLBACK=0 N_SKIPPED_TTY=0
@@ -228,6 +249,7 @@ sample() {
         read_cmdline "$pid"
         [[ -n $CMD ]] || continue
         cmd_of[$pid]=$CMD
+        comm_of[$pid]=$P_COMM
         case "$CMD" in
             *--type=renderer*) renderers+=("$pid") ;;
             # code-server and the remote server are plain node: no Chromium
@@ -248,7 +270,8 @@ sample() {
         anc=${ppid_of[$pid]:-0} hops=0
         while (( hops < 8 )) && [[ -n ${ppid_of[$anc]:-} ]]; do
             if [[ -n ${cmd_of[$anc]:-} && ${cmd_of[$anc]} != *--type=* ]]; then
-                if [[ -z ${is_a_root[$anc]:-} ]]; then
+                if [[ -z ${is_a_root[$anc]:-} ]] \
+                        && is_editor_main "${comm_of[$anc]:-}" "${cmd_of[$anc]}"; then
                     is_a_root[$anc]=1
                     roots+=("$anc")
                 fi
@@ -260,9 +283,29 @@ sample() {
     done
 
     ((${#roots[@]})) || return 0
+
+    # Canonical order. --report string-compares root_pids as the run identity,
+    # so the same set of roots must never serialize two ways — with two
+    # instances alive, renderer churn could otherwise flip the derivation
+    # order and a pure order flip would read as a restart.
+    for (( i = 1; i < ${#roots[@]}; i++ )); do
+        tmp=${roots[i]} j=$(( i - 1 ))
+        while (( j >= 0 && roots[j] > tmp )); do
+            roots[j+1]=${roots[j]}; j=$(( j - 1 ))
+        done
+        roots[j+1]=$tmp
+    done
+
     ROOT_EXES=()
     for pid in "${roots[@]}"; do
         ROOT_EXES[${cmd_of[$pid]%% *}]=1
+        # An editor launched from a shell keeps that shell's controlling
+        # terminal on every process it spawns. Remember each root's tty so the
+        # integrated-terminal filter below doesn't mistake the whole instance
+        # for terminal noise — that would make a terminal-launched code-server
+        # entirely invisible.
+        t=${tty_of[$pid]:-0}
+        [[ $t != 0 ]] && root_ttys[$t]=1
     done
     printf -v ROOT_IDS '%s;' "${roots[@]}"
     ROOT_IDS=${ROOT_IDS%;}
@@ -280,8 +323,11 @@ sample() {
         seen[$pid]=1
 
         # A controlling terminal means an integrated-terminal process: the
-        # user's shell and whatever it is running. Not VS Code's memory.
-        if [[ ${tty_of[$pid]:-0} != 0 ]]; then
+        # user's shell and whatever it is running. Not VS Code's memory. The
+        # exception is the editor's own tty — the one it inherited by being
+        # launched from a shell — which its Chromium children share.
+        t=${tty_of[$pid]:-0}
+        if [[ $t != 0 && -z ${root_ttys[$t]:-} ]]; then
             N_SKIPPED_TTY=$(( N_SKIPPED_TTY + 1 ))
             continue
         fi
@@ -316,8 +362,13 @@ sample() {
             *vscode-window-config=*) tag=window ;;
         esac
         (( PSS_EXACT )) || tag="${tag:+$tag }(rss estimate)"
-        printf -v row '%9d KB pss  %9d KB rss  %-10s pid=%-8s %s' \
-            "$MEM_KB" "$RSS_KB" "$ROLE" "$pid" "$tag"
+        if [[ -n $tag ]]; then
+            printf -v row '%9d KB pss  %9d KB rss  %-10s pid=%-8s %s' \
+                "$MEM_KB" "$RSS_KB" "$ROLE" "$pid" "$tag"
+        else
+            printf -v row '%9d KB pss  %9d KB rss  %-10s pid=%s' \
+                "$MEM_KB" "$RSS_KB" "$ROLE" "$pid"
+        fi
         DETAIL+=("$row")
     done
     return 0
@@ -389,6 +440,13 @@ Environment (all must be positive integers):
 USAGE
 }
 
+if (( $# > 1 )); then
+    echo "too many arguments" >&2; usage >&2; exit 2
+fi
+if (( $# == 1 )) && [[ -z $1 ]]; then
+    echo "unknown argument: ''" >&2; usage >&2; exit 2
+fi
+
 case "${1:-}" in
     -h|--help)    usage; exit 0 ;;
     -V|--version) printf 'vscode-memory-watch %s\n' "$VERSION"; exit 0 ;;
@@ -417,34 +475,50 @@ case "${1:-}" in
                 if (!("epoch" in idx) || !("root_pids" in idx) ||
                     !("total_pss_mb" in idx) || !("renderer_mb" in idx)) {
                     print "history file has an unrecognised header; it predates" > "/dev/stderr"
-                    print "this version. Move it aside and let a new one start." > "/dev/stderr"
+                    print "this version. Restarting the watcher rotates it aside." > "/dev/stderr"
                     bad = 1; exit 2
                 }
                 next
             }
             NF != ncol { next }              # truncated row (unclean shutdown)
+            $(idx["epoch"]) !~ /^[0-9]+$/ { next }   # re-joined log: a second
+                                                     # header is data-shaped
 
-            # First pass: the nominal cadence is the smallest gap between
-            # consecutive samples; anything larger is downtime.
+            # First pass: the nominal cadence is the MODAL gap between
+            # consecutive samples. Not the smallest: one daemon restart that
+            # writes a row seconds after the last would make every normal
+            # interval read as downtime and inflate the growth rate.
             NR == FNR {
-                if (pe > 0) { d = $(idx["epoch"]) - pe; if (d > 0 && (step == 0 || d < step)) step = d }
+                if (pe > 0) { d = $(idx["epoch"]) - pe; if (d > 0) dcount[d]++ }
                 pe = $(idx["epoch"])
                 next
             }
 
             {
-                if (step <= 0) step = 60
+                if (!cadence_done) {
+                    cadence_done = 1
+                    for (d in dcount)
+                        if (dcount[d] > bestc || (dcount[d] == bestc && d + 0 < step)) {
+                            bestc = dcount[d]; step = d + 0
+                        }
+                    if (step <= 0) step = 60
+                }
                 gap = (prev_epoch > 0) ? $(idx["epoch"]) - prev_epoch : 0
                 # A run ends when the heap under observation was thrown away.
                 # Two things do that: the main process set changing (VS Code
                 # restarted), or the renderer tier collapsing (a window reload,
                 # which leaves the main process untouched — so root pids alone
-                # would miss the single most common case).
-                reload = (n > 0 && prev_rend > 200 && \
-                          $(idx["renderer_mb"]) < prev_rend / 2)
-                if (n > 0 && ($(idx["root_pids"]) != prev_roots || reload)) {
-                    n = 0; gaps = 0
-                    if (reload) reloads++
+                # would miss the single most common case). A restart takes
+                # precedence: a new instance whose renderer happens to be
+                # smaller is not a reload, and reloads of a previous instance
+                # say nothing about this one.
+                restart = (n > 0 && $(idx["root_pids"]) != prev_roots)
+                reload  = (!restart && n > 0 && prev_rend > 200 && \
+                           $(idx["renderer_mb"]) < prev_rend / 2)
+                if (restart || reload) {
+                    n = 0; gaps = 0; fallbacks = 0
+                    if (restart) reloads = 0
+                    if (reload)  reloads++
                 } else if (gap > 5 * step) {
                     # Not a restart: memory survives sleep, so the run
                     # continues. But hours the watcher was not running are not
@@ -470,7 +544,7 @@ case "${1:-}" in
             }
             END {
                 if (bad) exit 2
-                if (samples == 0) { print "no samples in current run"; exit 1 }
+                if (samples == 0) { print "no samples in current run" > "/dev/stderr"; exit 1 }
                 printf "current run: %s -> %s (%d samples, %d min", \
                     t0, t1, samples, (e1 - e0) / 60 + 0.5
                 if (reloads > 0) printf ", %d window reload(s) ago", reloads
@@ -507,7 +581,10 @@ case "${1:-}" in
     *)  echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
 esac
 
-mkdir -p "$STATE_DIR" "$SNAP_DIR"
+mkdir -p "$STATE_DIR" "$SNAP_DIR" || {
+    echo "cannot create $STATE_DIR; nothing would be recorded" >&2
+    exit 1
+}
 
 # The tier list is the schema. If it has changed since this log was started,
 # rotate rather than append rows that no longer match their own header — a
@@ -529,13 +606,16 @@ if [[ ! -r /proc/self/smaps_rollup ]]; then
     echo "         overstates a shared-memory process tree. Figures approximate." >&2
 fi
 
-# Survives a restart, so a crash-looping unit cannot re-notify every 10s.
+# Survives a restart, so a crash-looping unit cannot re-notify every 10s. The
+# length cap matters: an all-digit stamp beyond int64 would wrap negative in
+# the cooldown arithmetic and suppress notifications forever.
 last_notify=0
 [[ -r $NOTIFY_STAMP ]] && read -r last_notify <"$NOTIFY_STAMP" 2>/dev/null
-[[ $last_notify == +([0-9]) ]] || last_notify=0
+[[ $last_notify == +([0-9]) && ${#last_notify} -le 10 ]] || last_notify=0
 
 rows=$(( $(wc -l <"$HISTORY" 2>/dev/null || echo 1) - 1 ))
 run_peak_total=0 run_peak_proc=0
+prev_root_ids="" prev_rend_mb=0 snap=""
 
 while :; do
     sample
@@ -556,26 +636,41 @@ while :; do
 
     total_mb=$(( SUM_PSS_KB / 1024 ))
     top_mb=$(( TOP_KB / 1024 ))
+    rend_mb=$(( ${TIER_KB[renderer]:-0} / 1024 ))
     printf -v now '%(%s)T' -1
 
-    # Snapshot on a new high, not merely on crossing the line once: the point
-    # is to capture the peak, and the cooldown would otherwise freeze the
-    # evidence at whatever the tree looked like when it first crossed.
-    if (( (total_mb >= WARN_TOTAL_MB || top_mb >= WARN_PROC_MB)
-          && (total_mb > run_peak_total || top_mb > run_peak_proc) )); then
-        run_peak_total=$(( total_mb > run_peak_total ? total_mb : run_peak_total ))
-        run_peak_proc=$(( top_mb > run_peak_proc ? top_mb : run_peak_proc ))
+    # The peak trackers describe the CURRENT run, mirroring --report's run
+    # boundaries: without the reset, one big day would set a bar that day
+    # two's smaller (but still over-threshold) leak never clears, and the
+    # daemon would sit silent through exactly the event it exists to catch.
+    if [[ $ROOT_IDS != "$prev_root_ids" ]] \
+            || (( prev_rend_mb > 200 && rend_mb < prev_rend_mb / 2 )); then
+        run_peak_total=0 run_peak_proc=0 snap=""
+    fi
+    prev_root_ids=$ROOT_IDS prev_rend_mb=$rend_mb
 
-        printf -v snap_stamp '%(%Y%m%dT%H%M%S)T' -1
-        snap="$SNAP_DIR/$snap_stamp.txt"
-        sort_detail
-        {
-            printf '# vscode-memory-watch %s snapshot %(%Y-%m-%dT%H:%M:%S%z)T\n' "$VERSION" -1
-            emit_report '# '
-            echo
-            printf '%s\n' "${DETAIL[@]}"
-        } >"$snap"
+    if (( total_mb >= WARN_TOTAL_MB || top_mb >= WARN_PROC_MB )); then
+        # One snapshot file per run, rewritten on each new high: the point is
+        # to capture the peak, and stopping at the first crossing would freeze
+        # the evidence at whatever the tree looked like when it crossed.
+        if (( total_mb > run_peak_total || top_mb > run_peak_proc )); then
+            run_peak_total=$(( total_mb > run_peak_total ? total_mb : run_peak_total ))
+            run_peak_proc=$(( top_mb > run_peak_proc ? top_mb : run_peak_proc ))
+            if [[ -z $snap ]]; then
+                printf -v snap_stamp '%(%Y%m%dT%H%M%S)T' -1
+                snap="$SNAP_DIR/$snap_stamp.txt"
+            fi
+            sort_detail
+            {
+                printf '# vscode-memory-watch %s snapshot %(%Y-%m-%dT%H:%M:%S%z)T\n' "$VERSION" -1
+                emit_report '# '
+                echo
+                printf '%s\n' "${DETAIL[@]}"
+            } >"$snap"
+        fi
 
+        # Notification is gated on the cooldown alone, not on a new high — a
+        # 15 GB tree is worth hearing about even if yesterday's hit 20.
         if (( now - last_notify >= NOTIFY_COOLDOWN )); then
             notify-send -u critical -a "VS Code memory" \
                 "VS Code at ${total_mb} MB" \
