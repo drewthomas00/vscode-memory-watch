@@ -1,0 +1,16 @@
+current run: 2026-08-11T18:45:37-04:00 -> 2026-08-11T22:44:02-04:00 (240 samples, ~240 min)
+
+tier              start        now       peak     growth
+total_pss        3829 MB     8846 MB     9634 MB    +5017 MB
+total_rss        5919 MB    11567 MB    12357 MB    +5648 MB
+claude           1030 MB     2175 MB     2234 MB    +1145 MB
+exthost          1063 MB     1152 MB     2388 MB      +89 MB
+renderer          924 MB     4491 MB     5317 MB    +3567 MB
+tsserver          369 MB      490 MB     1784 MB     +121 MB
+langserver        176 MB      285 MB      285 MB     +109 MB
+gpu                77 MB       81 MB       81 MB       +4 MB
+main              148 MB      149 MB      152 MB       +1 MB
+other              40 MB       21 MB       40 MB      -19 MB
+
+processes: 30 -> 31   claude sessions: 4 -> 8
+tree growth rate: +1254 MB/hour

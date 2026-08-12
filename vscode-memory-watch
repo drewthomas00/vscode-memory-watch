@@ -1,0 +1,250 @@
+#!/usr/bin/env bash
+# Sample the memory of the VS Code / Claude Code process tree and record a
+# growth curve, so the ~2-day "VS Code ate 20 GB" balloon can be attributed to a
+# specific tier instead of guessed at. Reloading the window destroys the
+# evidence, so the numbers have to be collected before the crash, not after.
+#
+# Three tiers hold conversation state at once and none of them evict:
+#   - claude    one native-binary process per open Claude tab
+#   - exthost   the extension host that pumps the stream-json firehose
+#   - renderer  the webview that renders every message
+# The CSV says which one climbs; the snapshot says what it looked like at peak.
+#
+# Usage: vscode-memory-watch [--once|--report]
+#   --once     print one reading to stdout and exit (no logging, no notify)
+#   --report   summarise the recorded history: growth per tier since the last
+#              VS Code restart, so the climbing tier names itself
+
+set -u
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/vscode-memory-watch"
+HISTORY="$STATE_DIR/history.csv"
+SNAP_DIR="$STATE_DIR/snapshots"
+
+INTERVAL="${VSCODE_MEM_INTERVAL:-60}"      # seconds between samples
+WARN_TOTAL_MB="${VSCODE_MEM_WARN_TOTAL:-12000}"  # whole-tree PSS warning line
+# The known offender is a single webview renderer that climbs on its own, so the
+# per-process line has to trip well before the tree total does — by the time the
+# whole tree is at 12 GB the window is already unusable.
+WARN_PROC_MB="${VSCODE_MEM_WARN_PROC:-4000}"     # single-process PSS warning line
+NOTIFY_COOLDOWN="${VSCODE_MEM_COOLDOWN:-1800}"   # seconds between notifications
+MAX_HISTORY_BYTES=$((5 * 1024 * 1024))
+
+last_notify=0
+
+# Per-process memory in KB. PSS is the honest number for Electron: RSS counts
+# every shared mapping once per process and badly overstates a 40-process tree.
+mem_kb() {
+    local pid="$1" kb
+    kb="$(awk '/^Pss:/ {sum += $2} END {print sum+0}' "/proc/$pid/smaps_rollup" 2>/dev/null)"
+    if [ -z "$kb" ] || [ "$kb" = "0" ]; then
+        # smaps_rollup is unreadable for some short-lived/exiting processes
+        kb="$(awk '{print int($2 * 4)}' "/proc/$pid/statm" 2>/dev/null)"
+    fi
+    echo "${kb:-0}"
+}
+
+rss_kb() {
+    awk '{print int($2 * 4)}' "/proc/$1/statm" 2>/dev/null || echo 0
+}
+
+# Which tier a process belongs to, or nothing if it is not part of the tree.
+# Classified from the cmdline rather than by name: every tier is the same
+# `electron` binary, so the name alone tells you nothing.
+classify() {
+    local cmd="$1"
+    case "$cmd" in
+        *native-binary/claude*)          echo claude ;;
+        *tsserver.js*|*typingsInstaller.js*) echo tsserver ;;
+        *eslintServer.js*|*jsonServerMain*|*serverWorkerMain*|*language-features*) echo langserver ;;
+        *"/usr/lib/code/code.mjs"*)      echo main ;;
+        *--type=renderer*)
+            case "$cmd" in
+                *"Code - OSS"*|*app-path=/usr/lib/code*) echo renderer ;;
+                *) echo "" ;;
+            esac ;;
+        *--type=gpu-process*)
+            case "$cmd" in *"Code - OSS"*) echo gpu ;; *) echo "" ;; esac ;;
+        *--type=zygote*)
+            case "$cmd" in *"Code - OSS"*) echo zygote ;; *) echo "" ;; esac ;;
+        *--type=utility*)
+            case "$cmd" in
+                *node.mojom.NodeService*) echo exthost ;;
+                *"Code - OSS"*)           echo utility ;;
+                *)                        echo "" ;;
+            esac ;;
+        *"Code - OSS"*|*/usr/lib/code/*) echo other ;;
+        *)                               echo "" ;;
+    esac
+}
+
+# Walk /proc directly. Deliberately no pgrep -f / ps | grep: the pattern would
+# match this script's own command line and pollute the totals.
+sample() {
+    local detail="$1"   # file to write the per-process table to, or empty
+    local pid cmd role kb rkb
+    local total_kb=0 total_rss_kb=0 nprocs=0 nclaude=0
+    local top_role="-" top_pid=0 top_kb=0
+
+    declare -A tier_kb=()
+    : >"${detail:-/dev/null}"
+
+    for pid in /proc/[0-9]*; do
+        pid="${pid#/proc/}"
+
+        # Cheap gate first. Reading comm is a bash builtin read; expanding the
+        # full cmdline costs a fork, and doing that for every process on the
+        # system dwarfs the cost of the ~30 we actually care about.
+        local comm
+        comm="$(<"/proc/$pid/comm")" 2>/dev/null || continue
+        case "$comm" in
+            electron|code-oss|claude|node) ;;
+            *) continue ;;
+        esac
+
+        [ -r "/proc/$pid/cmdline" ] || continue
+        cmd="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null)"
+        [ -n "$cmd" ] || continue
+
+        role="$(classify "$cmd")"
+        [ -n "$role" ] || continue
+
+        kb="$(mem_kb "$pid")"
+        rkb="$(rss_kb "$pid")"
+        [ "$kb" -gt 0 ] 2>/dev/null || continue
+
+        total_kb=$((total_kb + kb))
+        total_rss_kb=$((total_rss_kb + rkb))
+        nprocs=$((nprocs + 1))
+        tier_kb[$role]=$(( ${tier_kb[$role]:-0} + kb ))
+        [ "$role" = claude ] && nclaude=$((nclaude + 1))
+
+        if [ "$kb" -gt "$top_kb" ]; then
+            top_kb="$kb"; top_pid="$pid"; top_role="$role"
+        fi
+
+        if [ -n "$detail" ]; then
+            local tag=""
+            case "$cmd" in
+                *--resume=*) tag="session=$(sed -E 's/.*--resume=([0-9a-f-]+).*/\1/' <<<"$cmd")" ;;
+                *vscode-window-config=*) tag="window" ;;
+            esac
+            printf '%8d KB pss  %8d KB rss  %-10s pid=%-8s %s\n' \
+                "$kb" "$rkb" "$role" "$pid" "$tag" >>"$detail"
+        fi
+    done
+
+    if [ -n "$detail" ]; then
+        sort -rn -o "$detail" "$detail"
+    fi
+
+    # Emit: total_mb rss_mb nprocs nclaude claude exthost renderer tsserver \
+    #       langserver gpu main other top_role top_pid top_mb
+    local o=0
+    for r in utility zygote other; do o=$((o + ${tier_kb[$r]:-0})); done
+    echo "$((total_kb / 1024)) $((total_rss_kb / 1024)) $nprocs $nclaude" \
+         "$(( ${tier_kb[claude]:-0} / 1024 ))" \
+         "$(( ${tier_kb[exthost]:-0} / 1024 ))" \
+         "$(( ${tier_kb[renderer]:-0} / 1024 ))" \
+         "$(( ${tier_kb[tsserver]:-0} / 1024 ))" \
+         "$(( ${tier_kb[langserver]:-0} / 1024 ))" \
+         "$(( ${tier_kb[gpu]:-0} / 1024 ))" \
+         "$(( ${tier_kb[main]:-0} / 1024 ))" \
+         "$((o / 1024))" \
+         "$top_role" "$top_pid" "$((top_kb / 1024))"
+}
+
+if [ "${1:-}" = "--once" ]; then
+    detail="$(mktemp)"
+    read -r total rss nprocs nclaude claude exthost renderer tsserver \
+            langserver gpu main other top_role top_pid top_mb < <(sample "$detail")
+    printf 'VS Code tree: %d MB PSS (%d MB RSS) across %d processes, %d Claude session(s)\n' \
+        "$total" "$rss" "$nprocs" "$nclaude"
+    printf '  claude=%dMB exthost=%dMB renderer=%dMB tsserver=%dMB langserver=%dMB gpu=%dMB main=%dMB other=%dMB\n' \
+        "$claude" "$exthost" "$renderer" "$tsserver" "$langserver" "$gpu" "$main" "$other"
+    printf '  largest: %s pid=%s at %d MB\n\n' "$top_role" "$top_pid" "$top_mb"
+    cat "$detail"
+    rm -f "$detail"
+    exit 0
+fi
+
+if [ "${1:-}" = "--report" ]; then
+    [ -s "$HISTORY" ] || { echo "no history yet: $HISTORY" >&2; exit 1; }
+    awk -F, '
+        NR == 1 { next }
+        {
+            # A drop in process count to near zero, or the total falling by more
+            # than half, means VS Code restarted: only measure the current run.
+            if (prev_total > 0 && $2 < prev_total / 2) { n = 0 }
+            prev_total = $2
+            n++
+            if (n == 1) { for (i = 2; i <= 13; i++) first[i] = $i; t0 = $1 }
+            for (i = 2; i <= 13; i++) { last[i] = $i; if ($i > peak[i]) peak[i] = $i }
+            t1 = $1; samples = n
+        }
+        END {
+            if (samples == 0) { print "no samples in current run"; exit 1 }
+            split("total_pss total_rss procs claude_procs claude exthost renderer tsserver langserver gpu main other", name, " ")
+            printf "current run: %s -> %s (%d samples, ~%d min)\n\n", t0, t1, samples, samples
+            printf "%-12s %10s %10s %10s %10s\n", "tier", "start", "now", "peak", "growth"
+            for (i = 2; i <= 13; i++) {
+                if (i == 4 || i == 5) continue
+                printf "%-12s %8d MB %8d MB %8d MB %+8d MB\n", name[i-1], first[i], last[i], peak[i], last[i] - first[i]
+            }
+            printf "\nprocesses: %d -> %d   claude sessions: %d -> %d\n", first[4], last[4], first[5], last[5]
+            hours = samples / 60.0
+            if (hours > 0.5) printf "tree growth rate: %+.0f MB/hour\n", (last[2] - first[2]) / hours
+        }
+    ' "$HISTORY"
+    exit 0
+fi
+
+mkdir -p "$STATE_DIR" "$SNAP_DIR"
+if [ ! -s "$HISTORY" ]; then
+    echo "timestamp,total_pss_mb,total_rss_mb,procs,claude_procs,claude_mb,exthost_mb,renderer_mb,tsserver_mb,langserver_mb,gpu_mb,main_mb,other_mb,top_role,top_pid,top_mb" >"$HISTORY"
+fi
+
+while :; do
+    if [ -s "$HISTORY" ] && [ "$(stat -c %s "$HISTORY" 2>/dev/null || echo 0)" -gt "$MAX_HISTORY_BYTES" ]; then
+        mv -f "$HISTORY" "$HISTORY.1"
+        echo "timestamp,total_pss_mb,total_rss_mb,procs,claude_procs,claude_mb,exthost_mb,renderer_mb,tsserver_mb,langserver_mb,gpu_mb,main_mb,other_mb,top_role,top_pid,top_mb" >"$HISTORY"
+    fi
+
+    read -r total rss nprocs nclaude claude exthost renderer tsserver \
+            langserver gpu main other top_role top_pid top_mb < <(sample "")
+
+    # Nothing running: don't log a row of zeros every minute.
+    if [ "${nprocs:-0}" -eq 0 ]; then
+        sleep "$INTERVAL"
+        continue
+    fi
+
+    now="$(date +%s)"
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+        "$(date -Iseconds)" "$total" "$rss" "$nprocs" "$nclaude" "$claude" \
+        "$exthost" "$renderer" "$tsserver" "$langserver" "$gpu" "$main" \
+        "$other" "$top_role" "$top_pid" "$top_mb" >>"$HISTORY"
+
+    if [ "$total" -ge "$WARN_TOTAL_MB" ] || [ "$top_mb" -ge "$WARN_PROC_MB" ]; then
+        if [ $((now - last_notify)) -ge "$NOTIFY_COOLDOWN" ]; then
+            snap="$SNAP_DIR/$(date +%Y%m%dT%H%M%S).txt"
+            {
+                echo "# VS Code memory snapshot $(date -Iseconds)"
+                echo "# total ${total} MB PSS / ${rss} MB RSS, ${nprocs} procs, ${nclaude} Claude sessions"
+                echo "# claude=${claude} exthost=${exthost} renderer=${renderer} tsserver=${tsserver} langserver=${langserver} other=${other}"
+                echo
+            } >"$snap"
+            sample "$snap.detail" >/dev/null
+            cat "$snap.detail" >>"$snap" 2>/dev/null
+            rm -f "$snap.detail"
+
+            notify-send -u critical -a "VS Code memory" \
+                "VS Code at ${total} MB" \
+                "Largest: ${top_role} (pid ${top_pid}) at ${top_mb} MB. ${nclaude} Claude tabs open. Close finished tabs, or reload the window before it crashes." \
+                2>/dev/null
+            last_notify="$now"
+        fi
+    fi
+
+    sleep "$INTERVAL"
+done

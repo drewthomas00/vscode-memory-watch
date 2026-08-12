@@ -1,0 +1,14 @@
+[Unit]
+Description=Record VS Code / Claude Code process-tree memory growth
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/vscode-memory-watch
+Restart=always
+RestartSec=10
+# Pure observer: never let sampling compete with the thing it is measuring.
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=default.target

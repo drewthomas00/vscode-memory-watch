@@ -1,0 +1,35 @@
+# VS Code memory snapshot 2026-08-11T22:40:00-04:00
+# total 9024 MB PSS / 11746 MB RSS, 31 procs, 8 Claude sessions
+# claude=2164 exthost=1229 renderer=4600 tsserver=490 langserver=284 other=21
+
+ 4195427 KB pss   4307272 KB rss  renderer   pid=3369519  window
+  498048 KB pss    571256 KB rss  exthost    pid=3369526  
+  392186 KB pss    490308 KB rss  exthost    pid=3369496  
+  351536 KB pss    414928 KB rss  tsserver   pid=3403288  
+  343366 KB pss    462472 KB rss  claude     pid=3372538  session=55322f72-2988-4235-a7b2-20b35822b51a
+  342439 KB pss    462644 KB rss  claude     pid=3380222  session=e6e314ca-f038-44a1-8966-6bed829acd46
+  304072 KB pss    422184 KB rss  claude     pid=1146880  
+  299315 KB pss    419316 KB rss  claude     pid=3379966  session=e58f7834-5291-4807-8a75-3c3597dbfdc6
+  289317 KB pss    408324 KB rss  claude     pid=1193421  
+  281986 KB pss    401984 KB rss  renderer   pid=1313231  window
+  258316 KB pss    377240 KB rss  renderer   pid=1313239  window
+  236404 KB pss    353444 KB rss  claude     pid=3373316  
+  226771 KB pss    322668 KB rss  exthost    pid=3373100  
+  217539 KB pss    326500 KB rss  claude     pid=1136833  session=9c422134-5cea-418a-961b-bdf6313599a0
+  184143 KB pss    290260 KB rss  claude     pid=1146234  
+  154174 KB pss    306796 KB rss  main       pid=1313087  
+   98862 KB pss    162188 KB rss  tsserver   pid=3403287  
+   83243 KB pss    200312 KB rss  gpu        pid=1313157  
+   66789 KB pss    131780 KB rss  langserver pid=1200075  
+   51895 KB pss    114832 KB rss  tsserver   pid=3403306  
+   51469 KB pss    125020 KB rss  exthost    pid=1319008  
+   47298 KB pss    122700 KB rss  exthost    pid=1319011  
+   43440 KB pss    116220 KB rss  exthost    pid=3373122  
+   39169 KB pss     98304 KB rss  langserver pid=3439492  
+   36972 KB pss    100300 KB rss  langserver pid=3538809  
+   35851 KB pss     99008 KB rss  langserver pid=3373304  
+   34270 KB pss     99432 KB rss  langserver pid=3883603  
+   30041 KB pss     93088 KB rss  langserver pid=3370014  
+   25525 KB pss     88524 KB rss  langserver pid=3369957  
+   23062 KB pss     81072 KB rss  langserver pid=3373266  
+   21970 KB pss     81220 KB rss  utility    pid=1313160  
