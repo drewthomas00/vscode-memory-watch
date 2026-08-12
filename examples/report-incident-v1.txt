@@ -1,0 +1,20 @@
+# Literal output of "vscode-memory-watch --report" (v1.0) at the end of the
+# ~4-hour investigation that motivated this tool. Tier names differ slightly
+# from v1.1, which splits nodeutil out of exthost and helper out of other.
+
+current run: 2026-08-11T18:45:37-04:00 -> 2026-08-11T22:42:01-04:00 (238 samples, ~238 min)
+
+tier              start        now       peak     growth
+total_pss        3829 MB     8410 MB     9634 MB    +4581 MB
+total_rss        5919 MB    11131 MB    12357 MB    +5212 MB
+claude           1030 MB     2163 MB     2234 MB    +1133 MB
+exthost          1063 MB     1124 MB     2388 MB      +61 MB
+renderer          924 MB     4096 MB     5317 MB    +3172 MB
+tsserver          369 MB      490 MB     1784 MB     +121 MB
+langserver        176 MB      285 MB      285 MB     +109 MB
+gpu                77 MB       80 MB       81 MB       +3 MB
+main              148 MB      148 MB      152 MB       +0 MB
+other              40 MB       21 MB       40 MB      -19 MB
+
+processes: 30 -> 31   claude sessions: 4 -> 8
+tree growth rate: +1155 MB/hour
